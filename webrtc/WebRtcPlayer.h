@@ -36,6 +36,11 @@ private:
     MediaInfo _media_info;
     //播放的rtsp源
     std::weak_ptr<RtspMediaSource> _play_src;
+
+    // rtp 直接转发情况下通常会缺少 sps/pps, 这里从 sdp 中提取相关帧
+    toolkit::List<RtpPacket::Ptr> _config_packets;
+    bool _send_config_packets { false };
+
     //播放rtsp源的reader对象
     RtspMediaSource::RingType::RingReader::Ptr _reader;
 };

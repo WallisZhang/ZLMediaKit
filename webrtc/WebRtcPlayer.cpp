@@ -9,7 +9,10 @@
  */
 
 #include "WebRtcPlayer.h"
+
 #include "Common/config.h"
+#include "Extension/Factory.h"
+#include "Util/base64.h"
 
 using namespace std;
 
@@ -32,6 +35,68 @@ WebRtcPlayer::WebRtcPlayer(const EventPoller::Ptr &poller,
     _media_info = info;
     _play_src = src;
     CHECK(src);
+
+    GET_CONFIG(bool, direct_proxy, Rtsp::kDirectProxy);
+    if (direct_proxy) {
+        do {
+            auto video_track = src->getTrack(mediakit::TrackVideo);
+            if (!video_track) {
+                break;
+            }
+            if (video_track->getCodecId() != mediakit::CodecH264 && video_track->getCodecId() != mediakit::CodecH265) {
+                break;
+            }
+
+            auto sdp_parser = mediakit::SdpParser(video_track->getSdp(96)->getSdp());
+            auto sdp_video_track = sdp_parser.getTrack(mediakit::TrackVideo);
+            CHECK(sdp_video_track);
+            std::vector<std::string> config_frames;
+            for (const auto &attr : sdp_video_track->_attr) {
+                if (attr.first != "fmtp" || attr.second.find("sprop") == std::string::npos) {
+                    continue;
+                }
+
+                auto pos = attr.second.find(' ');
+                if (pos == std::string::npos) {
+                    continue;
+                }
+
+                auto format_parameters = toolkit::split(attr.second.substr(pos), ";");
+                for (auto fp : format_parameters) {
+                    toolkit::trim(fp);
+                    pos = fp.find('=');
+                    if (pos == std::string::npos) {
+                        continue;
+                    }
+                    if (!strncmp(fp.data(), "sprop-parameter-sets", 20)) {
+                        // h264
+                        pos = fp.find('=');
+                        auto parameters = toolkit::split(fp.substr(pos + 1), ",");
+                        for (const auto &p : parameters) {
+                            config_frames.emplace_back(decodeBase64(p));
+                        }
+                    } else if (   !strncmp(fp.data(), "sprop-vps", 9)
+                               || !strncmp(fp.data(), "sprop-sps", 9)
+                               || !strncmp(fp.data(), "sprop-pps", 9)) {
+                        // h265
+                        config_frames.emplace_back(decodeBase64(fp.substr(pos + 1)));
+                    }
+                }
+            }
+
+            if (auto encoder = mediakit::Factory::getRtpEncoderByCodecId(video_track->getCodecId(), sdp_video_track->_pt)) {
+                GET_CONFIG(uint32_t, video_mtu, Rtp::kVideoMtuSize);
+                encoder->setRtpInfo(sdp_video_track->_ssrc, video_mtu, sdp_video_track->_samplerate,
+                                    sdp_video_track->_pt, 2 * video_track->getTrackType(), video_track->getIndex());
+
+                for (const auto &f : config_frames) {
+                    _config_packets.emplace_back(
+                        encoder->getRtpInfo().makeRtp(TrackVideo, f.data(), f.size(), false, 0));
+                }
+                _send_config_packets = !_config_packets.empty();
+            }
+        } while (false);
+    }
 }
 
 void WebRtcPlayer::onStartWebRTC() {
@@ -55,6 +120,19 @@ void WebRtcPlayer::onStartWebRTC() {
             auto strong_self = weak_self.lock();
             if (!strong_self) {
                 return;
+            }
+            if (strong_self->_send_config_packets && !strong_self->_config_packets.empty() && !pkt->empty()) {
+                const auto &first_rtp = pkt->front();
+                auto seq = first_rtp->getSeq() - strong_self->_config_packets.size();
+                for (const auto &rtp : strong_self->_config_packets) {
+                    auto header = rtp->getHeader();
+                    header->seq = htons(seq++);
+                    header->stamp = htonl(first_rtp->getStamp());
+                    rtp->ntp_stamp = first_rtp->ntp_stamp;
+                    strong_self->onSendRtp(rtp, false);
+                }
+                // sent config frames once
+                strong_self->_send_config_packets = false;
             }
             size_t i = 0;
             pkt->for_each([&](const RtpPacket::Ptr &rtp) {
